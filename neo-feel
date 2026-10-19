@@ -1,0 +1,403 @@
+#!/usr/bin/env python3
+"""Approximate a MacBook Neo on this Mac, then put it back.
+
+The Neo (2026) is an Apple A18 Pro: 2 performance cores + 4 efficiency
+cores, 5 GPU cores, 8 GB unified memory, 60 GB/s. Its single core is
+close to an M-series performance core, so this tool does not slow one
+core. It does two things the OS allows without root:
+
+  * hold memory so about 8 GB of physical RAM is left for macOS and apps
+  * when work tries to use more than 6 cores, burn the extra cores so
+    the rest of the machine keeps about 6
+
+It cannot disable GPU cores, cut memory bandwidth, or fake the Neo's
+USB 2 port. Graphics and single-thread bursts stay faster than a Neo.
+"""
+
+from __future__ import annotations
+
+import argparse
+import ctypes
+import errno
+import json
+import mmap
+import os
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+STATE_DIR = Path.home() / ".neo-feel"
+PID_FILE = STATE_DIR / "neo-feel.pid"
+LOG_FILE = STATE_DIR / "neo-feel.log"
+TARGET_RAM = 8 * 1024**3
+TARGET_CORES = 6.0
+# Leave this much physical RAM even if the math says to hold more,
+# so the kernel is not pinned to zero free pages while we lock.
+MIN_FREE = 1536 * 1024**2
+CHUNK = 256 * 1024**2
+PAGE = 16 * 1024
+
+HOST_CPU_LOAD_INFO = 3
+CPU_STATE_USER = 0
+CPU_STATE_SYSTEM = 1
+CPU_STATE_IDLE = 2
+CPU_STATE_NICE = 3
+
+
+class HostCpuLoad(ctypes.Structure):
+    _fields_ = [("cpu_ticks", ctypes.c_uint * 4)]
+
+
+def sysctl(name: str) -> str:
+    return subprocess.check_output(["sysctl", "-n", name], text=True).strip()
+
+
+def machine() -> dict:
+    mem = int(sysctl("hw.memsize"))
+    try:
+        p = int(sysctl("hw.perflevel0.logicalcpu"))
+        e = int(sysctl("hw.perflevel1.logicalcpu"))
+    except subprocess.CalledProcessError:
+        p, e = os.cpu_count() or 1, 0
+    try:
+        brand = sysctl("machdep.cpu.brand_string")
+    except subprocess.CalledProcessError:
+        brand = "unknown"
+    return {
+        "brand": brand,
+        "mem": mem,
+        "ncpu": p + e if e else (os.cpu_count() or 1),
+        "p_cores": p,
+        "e_cores": e,
+    }
+
+
+def read_ticks() -> tuple[int, int]:
+    libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
+    info = HostCpuLoad()
+    count = ctypes.c_uint(ctypes.sizeof(info) // ctypes.sizeof(ctypes.c_int))
+    kr = libc.host_statistics(
+        libc.mach_host_self(),
+        HOST_CPU_LOAD_INFO,
+        ctypes.byref(info),
+        ctypes.byref(count),
+    )
+    if kr != 0:
+        raise OSError(f"host_statistics failed ({kr})")
+    ticks = info.cpu_ticks
+    busy = ticks[CPU_STATE_USER] + ticks[CPU_STATE_SYSTEM] + ticks[CPU_STATE_NICE]
+    total = busy + ticks[CPU_STATE_IDLE]
+    return busy, total
+
+
+def self_cpu() -> float:
+    ru = os.times()
+    return ru.user + ru.system
+
+
+def plan(info: dict) -> dict:
+    hold = max(0, info["mem"] - TARGET_RAM)
+    # Never lock the machine down to the safety floor.
+    free_cap = max(0, info["mem"] - MIN_FREE)
+    hold = min(hold, free_cap)
+    already = info["mem"] <= TARGET_RAM + 512 * 1024**2
+    return {
+        "hold": 0 if already else hold,
+        "already_ram": already,
+        "cpu_limit": info["ncpu"] > TARGET_CORES,
+    }
+
+
+def gb(n: int) -> str:
+    return f"{n / 1024**3:.1f} GB"
+
+
+class Ballast:
+    def __init__(self, nbytes: int) -> None:
+        self.nbytes = nbytes
+        self.maps: list[mmap.mmap] = []
+        self.locked = 0
+
+    def acquire(self) -> None:
+        libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
+        left = self.nbytes
+        while left > 0:
+            n = min(CHUNK, left)
+            # page-align
+            n -= n % PAGE
+            if n <= 0:
+                break
+            buf = mmap.mmap(-1, n)
+            # Touch every page so the kernel commits it.
+            step = PAGE
+            for off in range(0, n, step):
+                buf[off] = 1
+            addr = ctypes.c_void_p.from_buffer(buf)
+            if libc.mlock(addr, n) == 0:
+                self.locked += n
+            else:
+                err = ctypes.get_errno()
+                if err not in (errno.EAGAIN, errno.ENOMEM, errno.EPERM):
+                    buf.close()
+                    raise OSError(err, "mlock")
+                # Still resident from the touch. Keep the mapping.
+            self.maps.append(buf)
+            left -= n
+            # Stop early if the machine is already at the floor.
+            if resident_pressure_too_high():
+                break
+
+    def release(self) -> None:
+        libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
+        for buf in self.maps:
+            try:
+                addr = ctypes.c_void_p.from_buffer(buf)
+                libc.munlock(addr, len(buf))
+            except Exception:
+                pass
+            buf.close()
+        self.maps.clear()
+
+
+def resident_pressure_too_high() -> bool:
+    """True when free+speculative pages drop under ~768 MB."""
+    try:
+        out = subprocess.check_output(["vm_stat"], text=True)
+    except subprocess.CalledProcessError:
+        return False
+    pages = {}
+    global PAGE
+    for line in out.splitlines():
+        if "page size of" in line and "bytes" in line:
+            try:
+                PAGE = int(line.split("page size of", 1)[1].split()[0])
+            except ValueError:
+                pass
+        if ":" not in line:
+            continue
+        k, v = line.split(":", 1)
+        v = v.strip().rstrip(".")
+        if v.isdigit():
+            pages[k.strip()] = int(v)
+    free = pages.get("Pages free", 0) + pages.get("Pages speculative", 0)
+    return free * PAGE < 768 * 1024**2
+
+
+def cpu_loop(stop: list[bool], duty: list[float]) -> None:
+    # One worker. duty in 0..1 is the fraction of each 100 ms slice to burn.
+    while not stop[0]:
+        d = duty[0]
+        if d <= 0.01:
+            time.sleep(0.2)
+            continue
+        slice_s = 0.1
+        burn = slice_s * min(d, 1.0)
+        end = time.perf_counter() + burn
+        x = 0
+        while time.perf_counter() < end:
+            x = (x * 1664525 + 1013904223) & 0xFFFFFFFF
+        rest = slice_s - burn
+        if rest > 0:
+            time.sleep(rest)
+
+
+def serve(hold: int, limit_cpu: bool) -> None:
+    import threading
+
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    ballast = Ballast(hold)
+    stop = [False]
+    duty = [0.0]
+    threads: list[threading.Thread] = []
+
+    def shutdown(*_a) -> None:
+        stop[0] = True
+
+    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, shutdown)
+
+    log = open(LOG_FILE, "a", buffering=1)
+    log.write(f"start pid={os.getpid()} hold={hold} cpu={limit_cpu}\n")
+    if hold:
+        ballast.acquire()
+        log.write(f"held={sum(len(m) for m in ballast.maps)} locked={ballast.locked}\n")
+
+    ncpu = os.cpu_count() or 1
+    if limit_cpu:
+        # Enough workers to occupy every core we might need to soak.
+        for _ in range(max(1, ncpu)):
+            t = threading.Thread(target=cpu_loop, args=(stop, duty), daemon=True)
+            t.start()
+            threads.append(t)
+
+    prev_busy, prev_total = read_ticks()
+    prev_self = self_cpu()
+    prev_wall = time.perf_counter()
+    while not stop[0]:
+        time.sleep(0.4)
+        if not limit_cpu:
+            continue
+        busy, total = read_ticks()
+        now_self = self_cpu()
+        now = time.perf_counter()
+        dt = max(1e-3, now - prev_wall)
+        db = busy - prev_busy
+        dtot = total - prev_total
+        prev_busy, prev_total = busy, total
+        self_cores = max(0.0, (now_self - prev_self) / dt)
+        prev_self = now_self
+        prev_wall = now
+        if dtot <= 0:
+            continue
+        host_cores = (db / dtot) * ncpu
+        other = max(0.0, host_cores - self_cores)
+        # Push other processes back toward TARGET_CORES. Drop the burn
+        # when they are already under it, so a single core stays fast.
+        if other > TARGET_CORES + 0.4:
+            duty[0] = min(1.0, duty[0] + 0.15)
+        elif other < TARGET_CORES - 0.6:
+            duty[0] = max(0.0, duty[0] - 0.12)
+        if int(now) % 5 == 0:
+            log.write(
+                f"other={other:.2f} self={self_cores:.2f} duty={duty[0]:.2f}\n"
+            )
+
+    duty[0] = 0.0
+    ballast.release()
+    log.write("stop\n")
+    log.close()
+
+
+def write_pid(pid: int) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    PID_FILE.write_text(str(pid))
+
+
+def running_pid() -> int | None:
+    if not PID_FILE.exists():
+        return None
+    try:
+        pid = int(PID_FILE.read_text().strip())
+    except ValueError:
+        return None
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        PID_FILE.unlink(missing_ok=True)
+        return None
+    return pid
+
+
+def cmd_status() -> int:
+    info = machine()
+    p = plan(info)
+    pid = running_pid()
+    print(f"this Mac: {info['brand']}")
+    print(f"cores: {info['p_cores']} performance + {info['e_cores']} efficiency ({info['ncpu']} logical)")
+    print(f"memory: {gb(info['mem'])}")
+    print("Neo target: 2 performance + 4 efficiency cores, 8 GB, 5-core GPU")
+    if p["already_ram"]:
+        print("memory: already at or under 8 GB, nothing to hold")
+    else:
+        print(f"memory hold when on: {gb(p['hold'])} locked, leaving about 8 GB")
+    if not p["cpu_limit"]:
+        print("cpu: this Mac has 6 or fewer cores, no cap")
+    else:
+        print("cpu cap when on: parallel work shares about 6 cores; one core stays full speed")
+    print("not simulated: GPU core count, 60 GB/s memory bandwidth, USB 2 port, fanless thermals")
+    print(f"state: {'on (pid ' + str(pid) + ')' if pid else 'off'}")
+    return 0
+
+
+def cmd_on(dry_run: bool) -> int:
+    if running_pid():
+        print(f"already on (pid {running_pid()}). run: neo-feel off")
+        return 1
+    info = machine()
+    p = plan(info)
+    cmd_status()
+    if dry_run:
+        print("dry run: nothing started")
+        return 0
+    if p["hold"] == 0 and not p["cpu_limit"]:
+        print("this Mac is already in Neo range. nothing to do.")
+        return 0
+    pid = os.fork()
+    if pid > 0:
+        write_pid(pid)
+        print(f"on. pid {pid}. put it back with: neo-feel off")
+        return 0
+    os.setsid()
+    serve(p["hold"], p["cpu_limit"])
+    PID_FILE.unlink(missing_ok=True)
+    os._exit(0)
+
+
+def cmd_off() -> int:
+    pid = running_pid()
+    if not pid:
+        print("already off")
+        return 0
+    os.kill(pid, signal.SIGTERM)
+    for _ in range(50):
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            break
+        time.sleep(0.1)
+    else:
+        os.kill(pid, signal.SIGKILL)
+    PID_FILE.unlink(missing_ok=True)
+    print("off. memory hold released, cpu cap removed.")
+    return 0
+
+
+def cmd_run(argv: list[str]) -> int:
+    if not argv:
+        print("usage: neo-feel run -- <command>", file=sys.stderr)
+        return 2
+    env = os.environ.copy()
+    for key in (
+        "OMP_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+        "RAYON_NUM_THREADS",
+        "GOMAXPROCS",
+        "NUMBER_OF_PROCESSORS",
+    ):
+        env[key] = "6"
+    if not running_pid():
+        print("note: system cap is off. this only limits the child process. run `neo-feel on` to cap the whole Mac.")
+    return subprocess.call(argv, env=env)
+
+
+def main() -> int:
+    if sys.platform != "darwin":
+        print("neo-feel only runs on macOS.", file=sys.stderr)
+        return 2
+    ap = argparse.ArgumentParser(prog="neo-feel")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("status")
+    p_on = sub.add_parser("on")
+    p_on.add_argument("--dry-run", action="store_true")
+    sub.add_parser("off")
+    p_run = sub.add_parser("run")
+    p_run.add_argument("cmd", nargs=argparse.REMAINDER)
+    args = ap.parse_args()
+    if args.cmd == "status":
+        return cmd_status()
+    if args.cmd == "on":
+        return cmd_on(args.dry_run)
+    if args.cmd == "off":
+        return cmd_off()
+    argv = args.cmd
+    if argv and argv[0] == "--":
+        argv = argv[1:]
+    return cmd_run(argv)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
