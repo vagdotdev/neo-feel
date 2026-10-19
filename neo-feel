@@ -117,7 +117,7 @@ def gb(n: int) -> str:
 class Ballast:
     def __init__(self, nbytes: int) -> None:
         self.nbytes = nbytes
-        self.maps: list[mmap.mmap] = []
+        self.maps: list[tuple[mmap.mmap, int, int]] = []
         self.locked = 0
 
     def acquire(self) -> None:
@@ -125,38 +125,35 @@ class Ballast:
         left = self.nbytes
         while left > 0:
             n = min(CHUNK, left)
-            # page-align
             n -= n % PAGE
             if n <= 0:
                 break
             buf = mmap.mmap(-1, n)
             # Touch every page so the kernel commits it.
-            step = PAGE
-            for off in range(0, n, step):
+            for off in range(0, n, PAGE):
                 buf[off] = 1
-            addr = ctypes.c_void_p.from_buffer(buf)
+            holder = ctypes.c_char.from_buffer(buf)
+            addr = ctypes.addressof(holder)
             if libc.mlock(addr, n) == 0:
                 self.locked += n
             else:
                 err = ctypes.get_errno()
                 if err not in (errno.EAGAIN, errno.ENOMEM, errno.EPERM):
+                    del holder
                     buf.close()
                     raise OSError(err, "mlock")
-                # Still resident from the touch. Keep the mapping.
-            self.maps.append(buf)
+            # Drop the exported pointer so close() works later. The
+            # mapping stays alive, so the locked address stays valid.
+            del holder
+            self.maps.append((buf, addr, n))
             left -= n
-            # Stop early if the machine is already at the floor.
             if resident_pressure_too_high():
                 break
 
     def release(self) -> None:
         libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
-        for buf in self.maps:
-            try:
-                addr = ctypes.c_void_p.from_buffer(buf)
-                libc.munlock(addr, len(buf))
-            except Exception:
-                pass
+        for buf, addr, n in self.maps:
+            libc.munlock(addr, n)
             buf.close()
         self.maps.clear()
 
@@ -222,7 +219,7 @@ def serve(hold: int, limit_cpu: bool) -> None:
     log.write(f"start pid={os.getpid()} hold={hold} cpu={limit_cpu}\n")
     if hold:
         ballast.acquire()
-        log.write(f"held={sum(len(m) for m in ballast.maps)} locked={ballast.locked}\n")
+        log.write(f"held={sum(n for _, _, n in ballast.maps)} locked={ballast.locked}\n")
 
     ncpu = os.cpu_count() or 1
     if limit_cpu:
